@@ -10,3 +10,6 @@ __pycache__/
 
 pipeline/cache_*.log
 data/verified/*-ai.json.bak
+
+.env
+.env.*

@@ -3,6 +3,7 @@ import maplibregl from 'maplibre-gl';
 import { addBaseLayers, addSocietyLayers, BASE_MODES, createMap, OVERVIEW, setBaseMode, setHighlights, setSelected, setStates, startPulse } from './map.js';
 import { searchSocieties } from './search.js';
 import { createFeed } from './feed.js';
+import { closeStreetView, hasStreetView, onStreetViewMove, openStreetView } from './streetview.js';
 import { AMENITY_KEYS, DEFAULT_CRITERIA, NEAR, RANK, feetLabel, formatINR, matchSociety, matchUnit, priceFor, roomPasses } from './filters.js';
 
 const $ = (id) => document.getElementById(id);
@@ -130,15 +131,30 @@ function chip(label, on, onClick, cls = 'chip') {
 const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
 const toggle = (arr, v) => { const i = arr.indexOf(v); i >= 0 ? arr.splice(i, 1) : arr.push(v); };
 // Two-handle slider: a low and a high end, with a value bubble on the handle being moved or hovered.
-function dualRange(el, { min, max, step, fmt, onChange }) {
+function dualRange(el, { min, max, step, fmt, unit, onChange }) {
   el.classList.add('dual');
   el.innerHTML = '<div class="track"><i></i></div><input type="range" class="lo" aria-label="Lowest"><input type="range" class="hi" aria-label="Highest"><b class="bubble blo"></b><b class="bubble bhi"></b>';
   const lo = el.querySelector('.lo'), hi = el.querySelector('.hi'), fill = el.querySelector('.track i');
+  // Typed boxes under the slider, in friendlier units (box = slider value × k). Empty min = no minimum, empty max = Any.
+  const box = document.createElement('div');
+  box.className = 'dual-in';
+  box.innerHTML = '<input type="number" min="0" step="any" inputmode="decimal" placeholder="Min" aria-label="Minimum"><span>to</span><input type="number" min="0" step="any" inputmode="decimal" placeholder="Any" aria-label="Maximum"><small></small>';
+  el.after(box);
+  const [blo, bhi] = box.querySelectorAll('input');
+  const k = () => api.cfg.k || 1;
+  const show = (a, b) => {
+    blo.value = a > api.cfg.min ? +(a * k()).toFixed(2) : '';
+    bhi.value = b < api.cfg.max ? +(b * k()).toFixed(2) : '';
+  };
   const api = {
-    cfg: { min, max, step, fmt },
-    set(a, b) { lo.value = a; hi.value = b; api.paint(); },
+    cfg: { min, max, step, fmt, unit },
+    set(a, b) { show(a, b); lo.value = a; hi.value = b; api.paint(); },
     get() { return [+lo.value, +hi.value]; },
-    reconfig(c) { Object.assign(api.cfg, c); for (const r of [lo, hi]) { r.min = api.cfg.min; r.max = api.cfg.max; r.step = api.cfg.step; } },
+    reconfig(c) {
+      Object.assign(api.cfg, c);
+      for (const r of [lo, hi]) { r.min = api.cfg.min; r.max = api.cfg.max; r.step = api.cfg.step; }
+      box.querySelector('small').textContent = api.cfg.unit || '';
+    },
     paint() {
       const { min: a, max: b, fmt: f } = api.cfg;
       const pa = ((+lo.value - a) / (b - a)) * 100, pb = ((+hi.value - a) / (b - a)) * 100;
@@ -151,9 +167,15 @@ function dualRange(el, { min, max, step, fmt, onChange }) {
   api.reconfig({});
   const move = (which) => () => {
     if (+lo.value > +hi.value) (which === 'lo' ? lo : hi).value = which === 'lo' ? hi.value : lo.value;
-    el.classList.add('active'); api.paint(); onChange(...api.get());
+    el.classList.add('active'); api.paint(); show(...api.get()); onChange(...api.get());
   };
   lo.oninput = move('lo'); hi.oninput = move('hi');
+  // typed numbers are used exactly; the slider only snaps for display
+  blo.oninput = bhi.oninput = () => {
+    const a = blo.value === '' ? api.cfg.min : Math.max(api.cfg.min, +blo.value / k());
+    const b = bhi.value === '' ? api.cfg.max : Math.min(api.cfg.max, +bhi.value / k());
+    lo.value = a; hi.value = b; api.paint(); onChange(a, b);
+  };
   for (const r of [lo, hi]) r.onpointerup = r.onblur = () => el.classList.remove('active');
   return api;
 }
@@ -178,7 +200,7 @@ function buildFilters() {
       return l;
     }));
   };
-  sizeSlider = dualRange($('f-size'), { min: 0, max: 8000, step: 50, fmt: (v, end) => (end === 'hi' && v >= 8000 ? 'Any' : `${v.toLocaleString()} sq ft · ${Math.round(v / 9)} gaj`),
+  sizeSlider = dualRange($('f-size'), { min: 0, max: 8000, step: 50, unit: 'sq ft', fmt: (v, end) => (end === 'hi' && v >= 8000 ? 'Any' : `${v.toLocaleString()} sq ft · ${Math.round(v / 9)} gaj`),
     onChange: (a, b) => { crit.minSqft = a; crit.maxSqft = b >= 8000 ? null : b; labels(); applyFilters(); } });
   priceSlider = dualRange($('f-price'), { min: 0, max: 20, step: 0.25, fmt: (v) => v, onChange: (a, b) => {
     const top = priceSlider.cfg.max, unit = crit.mode === 'rent' ? 1000 : 1e7;
@@ -206,8 +228,8 @@ function buildFilters() {
     if (crit.roomArea) $('f-area-range').value = crit.roomArea / 9;
     sizeSlider.set(crit.minSqft || 0, crit.maxSqft ?? 8000);
     const rent = crit.mode === 'rent';
-    priceSlider.reconfig(rent ? { min: 0, max: 500, step: 5, fmt: (v, end) => (end === 'hi' && v >= 500 ? 'Any' : v ? `${formatINR(v * 1000)}/mo` : '₹0') }
-      : { min: 0, max: 20, step: 0.25, fmt: (v, end) => (end === 'hi' && v >= 20 ? 'Any' : v ? formatINR(v * 1e7) : '₹0') });
+    priceSlider.reconfig(rent ? { min: 0, max: 500, step: 5, k: 1, unit: '₹ thousand/mo', fmt: (v, end) => (end === 'hi' && v >= 500 ? 'Any' : v ? `${formatINR(v * 1000)}/mo` : '₹0') }
+      : { min: 0, max: 20, step: 0.25, k: 100, unit: '₹ lakh', fmt: (v, end) => (end === 'hi' && v >= 20 ? 'Any' : v ? formatINR(v * 1e7) : '₹0') });
     priceSlider.set(rent ? (crit.minRent || 0) / 1000 : (crit.minPrice || 0) / 1e7, rent ? (crit.maxRent ? crit.maxRent / 1000 : 500) : (crit.maxPrice ? crit.maxPrice / 1e7 : 20));
     $('f-ready').checked = crit.ready;
     $('f-only').checked = !!crit.only;
@@ -345,6 +367,7 @@ function openSociety(sid, { fly = true } = {}) {
   const s = byId.get(sid);
   if (!s) return;
   if (map) setSelected(map, sid, selected);
+  if (sid !== selected) closeStreetView();
   selected = sid;
   if (fly && map) map.flyTo({ center: [s.lng, s.lat], zoom: mobile ? 15.4 : 16.2, pitch: is3d ? 55 : 0, bearing: 0, duration: 2600, essential: true,
     offset: mobile ? [0, -80] : [-180, 0] });
@@ -356,6 +379,7 @@ function openSociety(sid, { fly = true } = {}) {
 
 function closeCard() {
   $('card').hidden = true;
+  closeStreetView();
   document.body.classList.remove('has-card');
   if (mobile) showMobile('search');
   if (map && selected) setSelected(map, null, selected);
@@ -412,7 +436,7 @@ function renderCard(s) {
   $('card').innerHTML = `
     <div class="card-head">
       <div><span class="badge ${st}">${STATE_LABEL[st]}</span> ${s.verified ? '<span class="badge match">checked by hand</span>' : ''}${s.ai_read ? '<span class="badge likely">AI-read plans</span>' : ''}</div>
-      <div class="row-gap"><button class="iconbtn star ${inList ? 'on' : ''}" id="c-star" title="${inList ? 'Remove from my list' : 'Add to my list'}">${inList ? '★' : '☆'}</button><button class="iconbtn" id="c-close" aria-label="Close">×</button></div>
+      <div class="row-gap">${hasStreetView ? '<button class="btnlink" id="c-sv" title="Walk the street outside">Street view</button>' : ''}<button class="iconbtn star ${inList ? 'on' : ''}" id="c-star" title="${inList ? 'Remove from my list' : 'Add to my list'}">${inList ? '★' : '☆'}</button><button class="iconbtn" id="c-close" aria-label="Close">×</button></div>
     </div>
     ${photos}
     <h2>${esc(s.name)}</h2>
@@ -442,6 +466,7 @@ function renderCard(s) {
   $('card').hidden = false;
   $('c-close').onclick = () => { stopTour(); closeCard(); };
   $('c-star').onclick = () => { toggle(myList, s.id); saveList(); renderCard(s); renderResults(); };
+  if (hasStreetView) $('c-sv').onclick = () => openStreetView(s);
   if (!details) loadDetails().then(() => { if (selected === s.id) renderCard(s); });
 }
 
@@ -554,7 +579,18 @@ function exportResults() {
 }
 
 // ---------- map buttons and theme ----------
-let is3d = true, youMarker = null;
+let is3d = true, youMarker = null, svMarker = null;
+// where the street view box is standing, and which way it looks
+onStreetViewMove((at, heading) => {
+  if (!map) return;
+  if (!at) return svMarker?.remove();
+  if (!svMarker) {
+    const el = Object.assign(document.createElement('div'), { className: 'sv-man', innerHTML: '<i></i>' });
+    svMarker = new maplibregl.Marker({ element: el, rotationAlignment: 'map', pitchAlignment: 'map' });
+  }
+  svMarker.setLngLat(at).setRotation(heading).addTo(map);
+  if (!map.getBounds().contains(at)) map.easeTo({ center: at, duration: 600 });
+});
 const SUN = '<svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="currentColor" stroke-width="1.8"/></svg>';
 const MOON = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
 function setBase(mode) {
