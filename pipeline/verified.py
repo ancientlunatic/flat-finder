@@ -1,4 +1,3 @@
-"""Load hand-verified research and convert printed room sizes to feet."""
 import json
 import pathlib
 import re
